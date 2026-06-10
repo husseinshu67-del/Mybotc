@@ -1,2 +1,5 @@
-[deploy]
-startCommand = "python Mycode.py"
+[variables]
+TELEGRAM_BOT_TOKEN = "7661383575:AAFvNMf9S9-P9O5YyIHeN5Kr9KxtGRso078"
+ADMIN_IDS = "1431708650"
+USE_PROXY = "false"
+PROXY_URL = ""
